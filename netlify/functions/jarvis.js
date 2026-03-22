@@ -29,7 +29,12 @@
 // SUPABASE_URL         — Your Supabase project URL
 // SUPABASE_SERVICE_KEY — ⚠ SERVICE ROLE key (not anon key)
 // ALLOWED_ORIGIN       — Optional; defaults to https://jarvis-ai-arena.netlify.app
-// RATE_LIMIT_PER_HOUR  — Optional; defaults to 30
+// RATE_LIMIT_PER_HOUR  — Optional; defaults to 30 (legacy/public IP fallback default)
+// ADMIN_DEMO_SECRET    — Optional; admin-mode secret for your own browser
+// DEMO_SESSION_LIMIT   — Optional; funded public turns per guest session (default 12)
+// DEMO_IP_HOURLY_LIMIT — Optional; funded public turns per IP per hour (default RATE_LIMIT_PER_HOUR)
+// DEMO_COOLDOWN_SECONDS — Optional; funded public minimum seconds between turns (default 10)
+// DEMO_GLOBAL_DAILY_LIMIT — Optional; funded public turns per day across all guests (default 100)
 
 const OPENROUTER_API_KEY  = process.env.OPENROUTER_API_KEY;
 const JARVIS_PIN          = process.env.JARVIS_PIN;
@@ -40,6 +45,10 @@ const SUPA_KEY            = process.env.SUPABASE_SERVICE_KEY;
 const ALLOWED_ORIGIN      = process.env.ALLOWED_ORIGIN || "https://jarvis-ai-arena.netlify.app";
 const RATE_LIMIT_PER_HOUR = parseInt(process.env.RATE_LIMIT_PER_HOUR || "30", 10);
 const ADMIN_DEMO_SECRET   = process.env.ADMIN_DEMO_SECRET || "";
+const DEMO_SESSION_LIMIT  = parseInt(process.env.DEMO_SESSION_LIMIT || "12", 10);
+const DEMO_IP_HOURLY_LIMIT = parseInt(process.env.DEMO_IP_HOURLY_LIMIT || String(RATE_LIMIT_PER_HOUR), 10);
+const DEMO_COOLDOWN_SECONDS = parseInt(process.env.DEMO_COOLDOWN_SECONDS || "10", 10);
+const DEMO_GLOBAL_DAILY_LIMIT = parseInt(process.env.DEMO_GLOBAL_DAILY_LIMIT || "100", 10);
 
 // FIX 3: Startup config validation.
 // If any required env var is missing, crash immediately with a clear
@@ -263,6 +272,7 @@ function createToken(options = {}) {
     expires,
     owner: OWNER_ID,
     isAdmin: options.isAdmin === true,
+    sid: options.sessionId || crypto.randomUUID(),
   })).toString("base64url");
   const sig = crypto.createHmac("sha256", JARVIS_SECRET).update(payload).digest("base64url");
   return `${payload}.${sig}`;
@@ -289,6 +299,7 @@ function readToken(token) {
       owner: decoded.owner || OWNER_ID,
       isAdmin: decoded.isAdmin === true,
       expires: decoded.expires,
+      sessionId: decoded.sid || null,
     };
   } catch { return null; }
 }
@@ -297,36 +308,141 @@ function verifyToken(token) {
   return !!readToken(token);
 }
 
+function getHeader(headers, key) {
+  if (!headers) return "";
+  const direct = headers[key];
+  if (direct != null) return direct;
+  const lower = headers[key.toLowerCase()];
+  if (lower != null) return lower;
+  const upper = headers[key.toUpperCase()];
+  if (upper != null) return upper;
+  return "";
+}
+
+function getClientIp(meta = {}) {
+  const headers = meta.headers || {};
+  const candidates = [
+    getHeader(headers, "x-nf-client-connection-ip"),
+    getHeader(headers, "x-forwarded-for"),
+    getHeader(headers, "client-ip"),
+    getHeader(headers, "x-real-ip"),
+    meta.ip || "",
+  ];
+
+  for (const raw of candidates) {
+    if (!raw) continue;
+    const ip = String(raw).split(",")[0].trim();
+    if (ip) return ip;
+  }
+  return "";
+}
+
+function hashIp(ip) {
+  if (!ip) return "";
+  return crypto.createHmac("sha256", JARVIS_SECRET).update(ip).digest("hex").slice(0, 24);
+}
+
+async function fetchRateLimitRows(ownerId, sinceIso) {
+  const res = await fetch(
+    `${SUPA_URL}/rest/v1/jarvis_ratelimit?owner_id=eq.${encodeURIComponent(ownerId)}&called_at=gte.${sinceIso}&select=id,called_at`,
+    { headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
+  );
+  const rows = await res.json();
+  return Array.isArray(rows) ? rows : null;
+}
+
+async function writeRateLimitRows(rows) {
+  const writeRes = await fetch(`${SUPA_URL}/rest/v1/jarvis_ratelimit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}`, "Prefer": "return=minimal" },
+    body: JSON.stringify(rows),
+  });
+  return writeRes;
+}
+
 // ── Rate Limiting ─────────────────────────────────────────────
 async function checkRateLimit(options = {}) {
   if (options.isAdmin) return { allowed: true, bypassed: true };
+
   try {
-    const windowStart = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const countRes = await fetch(
-      `${SUPA_URL}/rest/v1/jarvis_ratelimit?owner_id=eq.${encodeURIComponent(OWNER_ID)}&called_at=gte.${windowStart}&select=id`,
-      { headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
-    );
-    const rows = await countRes.json();
-    if (!Array.isArray(rows)) return { allowed: true };
-    if (rows.length >= RATE_LIMIT_PER_HOUR) return { allowed: false, count: rows.length, limit: RATE_LIMIT_PER_HOUR };
-    // FIX 4: Await the rate limit write and check it succeeded.
-    // Previously fire-and-forget — if Supabase was down the write silently
-    // failed and the request was allowed through anyway (fail-open).
-    // Now if the write fails we deny the request (fail-closed).
-    const writeRes = await fetch(`${SUPA_URL}/rest/v1/jarvis_ratelimit`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}`, "Prefer": "return=minimal" },
-      body: JSON.stringify({ owner_id: OWNER_ID, called_at: new Date().toISOString() }),
-    });
+    const sessionId = options.sessionId || crypto.randomUUID();
+    const clientIp = getClientIp(options.requestMeta || {});
+    const ipHash = hashIp(clientIp);
+
+    const now = Date.now();
+    const hourStartIso = new Date(now - 60 * 60 * 1000).toISOString();
+    const dayStartIso = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+    const cooldownStartIso = new Date(now - DEMO_COOLDOWN_SECONDS * 1000).toISOString();
+
+    const sessionBucket = `${OWNER_ID}:demo:session:${sessionId}`;
+    const ipBucket = ipHash ? `${OWNER_ID}:demo:ip:${ipHash}` : "";
+    const globalBucket = `${OWNER_ID}:demo:global`;
+
+    const sessionRows = await fetchRateLimitRows(sessionBucket, dayStartIso);
+    if (!Array.isArray(sessionRows)) return { allowed: false, reason: "RATE_LIMIT_DB_READ", count: -1, limit: DEMO_SESSION_LIMIT };
+    if (sessionRows.length >= DEMO_SESSION_LIMIT) {
+      return { allowed: false, reason: "SESSION_LIMIT", count: sessionRows.length, limit: DEMO_SESSION_LIMIT };
+    }
+
+    const recentSessionRows = sessionRows.filter(row => row.called_at && row.called_at >= cooldownStartIso);
+    if (recentSessionRows.length > 0) {
+      return { allowed: false, reason: "COOLDOWN", count: recentSessionRows.length, limit: 1, retryAfterSeconds: DEMO_COOLDOWN_SECONDS };
+    }
+
+    if (ipBucket) {
+      const ipRows = await fetchRateLimitRows(ipBucket, hourStartIso);
+      if (!Array.isArray(ipRows)) return { allowed: false, reason: "RATE_LIMIT_DB_READ", count: -1, limit: DEMO_IP_HOURLY_LIMIT };
+      if (ipRows.length >= DEMO_IP_HOURLY_LIMIT) {
+        return { allowed: false, reason: "IP_LIMIT", count: ipRows.length, limit: DEMO_IP_HOURLY_LIMIT };
+      }
+    }
+
+    const globalRows = await fetchRateLimitRows(globalBucket, dayStartIso);
+    if (!Array.isArray(globalRows)) return { allowed: false, reason: "RATE_LIMIT_DB_READ", count: -1, limit: DEMO_GLOBAL_DAILY_LIMIT };
+    if (globalRows.length >= DEMO_GLOBAL_DAILY_LIMIT) {
+      return { allowed: false, reason: "GLOBAL_DAILY_LIMIT", count: globalRows.length, limit: DEMO_GLOBAL_DAILY_LIMIT };
+    }
+
+    const writeRows = [
+      { owner_id: sessionBucket, called_at: new Date(now).toISOString() },
+      { owner_id: globalBucket, called_at: new Date(now).toISOString() },
+    ];
+    if (ipBucket) writeRows.push({ owner_id: ipBucket, called_at: new Date(now).toISOString() });
+
+    const writeRes = await writeRateLimitRows(writeRows);
     if (!writeRes.ok) {
       console.error("Rate limit write failed — status:", writeRes.status);
-      return { allowed: false, count: rows.length, limit: RATE_LIMIT_PER_HOUR };
+      return { allowed: false, reason: "RATE_LIMIT_DB_WRITE", count: sessionRows.length, limit: DEMO_SESSION_LIMIT };
     }
-    return { allowed: true };
+
+    return {
+      allowed: true,
+      sessionCount: sessionRows.length + 1,
+      sessionLimit: DEMO_SESSION_LIMIT,
+      ipTracked: !!ipBucket,
+      globalCount: globalRows.length + 1,
+      globalLimit: DEMO_GLOBAL_DAILY_LIMIT,
+    };
   } catch (e) {
     // FIX 4: fail-closed on any DB error — deny rather than allow
     console.error("Rate limit check error:", e?.message);
-    return { allowed: false, count: -1, limit: RATE_LIMIT_PER_HOUR };
+    return { allowed: false, reason: "RATE_LIMIT_DB_ERROR", count: -1, limit: DEMO_SESSION_LIMIT };
+  }
+}
+
+function formatRateLimitError(rl) {
+  if (!rl || rl.allowed) return "RATE LIMIT EXCEEDED — Try again later.";
+  switch (rl.reason) {
+    case "SESSION_LIMIT":
+      return `DEMO SESSION LIMIT REACHED — ${rl.count ?? "?"}/${rl.limit ?? DEMO_SESSION_LIMIT} funded turns used in this guest session.`;
+    case "IP_LIMIT":
+      return `DEMO IP LIMIT REACHED — ${rl.count ?? "?"}/${rl.limit ?? DEMO_IP_HOURLY_LIMIT} funded turns from this network in the last hour.`;
+    case "GLOBAL_DAILY_LIMIT":
+      return `DEMO CAPACITY REACHED — ${rl.count ?? "?"}/${rl.limit ?? DEMO_GLOBAL_DAILY_LIMIT} funded turns used today. Try again later.`;
+    case "COOLDOWN":
+      return `PLEASE WAIT ${rl.retryAfterSeconds ?? DEMO_COOLDOWN_SECONDS}s BEFORE SENDING ANOTHER FUNDED DEMO TURN.`;
+    default:
+      return `RATE LIMIT ACTIVE — Demo protection is temporarily blocking funded requests. Try again later.`;
   }
 }
 
@@ -1101,8 +1217,12 @@ exports.handler = async function (event) {
   if (action === "analyze") {
     if (!question && !fileText) return respond(400, { error: "No question provided" }, corsHeaders);
 
-    const rl = await checkRateLimit({ isAdmin: session.isAdmin });
-    if (!rl.allowed) return respond(429, { error: `RATE LIMIT EXCEEDED — ${rl.count ?? "?"}/${rl.limit ?? RATE_LIMIT_PER_HOUR} calls this hour. Try again later.` }, corsHeaders);
+    const rl = await checkRateLimit({
+      isAdmin: session.isAdmin,
+      sessionId: session.sessionId,
+      requestMeta: { headers: event.headers || {} },
+    });
+    if (!rl.allowed) return respond(429, { error: formatRateLimitError(rl) }, corsHeaders);
 
     const activeThreadId = threadId || crypto.randomUUID();
     let threadContext = "";
@@ -1408,7 +1528,7 @@ Challenge the Analyst's specific arguments above.`;
 };
 
 // ── Stream Handler ────────────────────────────────────────────
-exports.streamHandler = async function(body, send) {
+exports.streamHandler = async function(body, send, requestMeta = {}) {
   const streamRequestId = crypto.randomUUID();
   const streamStartedAt = Date.now();
   let streamClosed = false;
@@ -1448,9 +1568,13 @@ exports.streamHandler = async function(body, send) {
     if (!session) { safeSend("error", { message: "UNAUTHORIZED" }); return; }
     if (!question && !fileText) { safeSend("error", { message: "No question provided" }); return; }
 
-    const rl = await checkRateLimit({ isAdmin: session.isAdmin });
+    const rl = await checkRateLimit({
+      isAdmin: session.isAdmin,
+      sessionId: session.sessionId,
+      requestMeta,
+    });
     if (!rl.allowed) {
-      safeSend("error", { message: `RATE LIMIT EXCEEDED — ${rl.count ?? "?"}/${rl.limit ?? RATE_LIMIT_PER_HOUR} calls this hour.` });
+      safeSend("error", { message: formatRateLimitError(rl) });
       return;
     }
 

@@ -65,7 +65,7 @@ app.post("/api/jarvis/stream", async (req, res) => {
   };
 
   try {
-    await streamHandler(req.body, send);
+    await streamHandler(req.body, send, { headers: req.headers || {}, ip: req.ip || "" });
   } catch (err) {
     console.error("Stream error:", err);
     send("error", { message: "Stream failed" });
