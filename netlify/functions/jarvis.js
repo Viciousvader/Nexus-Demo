@@ -319,42 +319,6 @@ function getHeader(headers, key) {
   return "";
 }
 
-function normalizeIp(raw) {
-  if (!raw) return "";
-  const first = String(raw).split(",")[0].trim().toLowerCase();
-  if (!first || first === "unknown" || first === "null") return "";
-  return first.startsWith("::ffff:") ? first.slice(7) : first;
-}
-
-function isTrustedPublicIp(ip) {
-  if (!ip) return false;
-  if (ip === "localhost" || ip === "::1") return false;
-
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) {
-    const parts = ip.split(".").map(n => parseInt(n, 10));
-    if (parts.some(n => Number.isNaN(n) || n < 0 || n > 255)) return false;
-
-    const [a, b] = parts;
-    if (a === 10) return false;
-    if (a === 127) return false;
-    if (a === 192 && b === 168) return false;
-    if (a === 169 && b === 254) return false;
-    if (a === 172 && b >= 16 && b <= 31) return false;
-    if (a === 100 && b >= 64 && b <= 127) return false; // carrier-grade NAT / shared
-    if (a === 0) return false;
-    return true;
-  }
-
-  if (ip.includes(":")) {
-    if (ip.startsWith("fc") || ip.startsWith("fd")) return false; // unique local
-    if (ip.startsWith("fe80:")) return false; // link-local
-    if (ip === "::") return false;
-    return /^[0-9a-f:]+$/i.test(ip);
-  }
-
-  return false;
-}
-
 function getClientIp(meta = {}) {
   const headers = meta.headers || {};
   const candidates = [
@@ -366,9 +330,9 @@ function getClientIp(meta = {}) {
   ];
 
   for (const raw of candidates) {
-    const ip = normalizeIp(raw);
-    if (!ip) continue;
-    if (isTrustedPublicIp(ip)) return ip;
+    if (!raw) continue;
+    const ip = String(raw).split(",")[0].trim();
+    if (ip) return ip;
   }
   return "";
 }
@@ -411,11 +375,6 @@ async function checkRateLimit(options = {}) {
 
   try {
     const sessionId = options.sessionId || crypto.randomUUID();
-    const clientIp = getClientIp(options.requestMeta || {});
-    const ipHash = hashIp(clientIp);
-    if (!ipHash) {
-      console.log(JSON.stringify({ event: "RATE_LIMIT_IP_SKIPPED", reason: "NO_TRUSTED_PUBLIC_IP" }));
-    }
 
     const now = Date.now();
     const hourStartIso = new Date(now - 60 * 60 * 1000).toISOString();
@@ -423,7 +382,6 @@ async function checkRateLimit(options = {}) {
     const cooldownStartIso = new Date(now - DEMO_COOLDOWN_SECONDS * 1000).toISOString();
 
     const sessionBucket = buildRateBucket("s", sessionId);
-    const ipBucket = ipHash ? buildRateBucket("i", ipHash) : "";
     const globalBucket = buildRateBucket("g", "funded");
 
     const sessionRows = await fetchRateLimitRows(sessionBucket, dayStartIso);
@@ -437,14 +395,6 @@ async function checkRateLimit(options = {}) {
       return { allowed: false, reason: "COOLDOWN", count: recentSessionRows.length, limit: 1, retryAfterSeconds: DEMO_COOLDOWN_SECONDS };
     }
 
-    if (ipBucket) {
-      const ipRows = await fetchRateLimitRows(ipBucket, hourStartIso);
-      if (!Array.isArray(ipRows)) return { allowed: false, reason: "RATE_LIMIT_DB_READ", count: -1, limit: DEMO_IP_HOURLY_LIMIT };
-      if (ipRows.length >= DEMO_IP_HOURLY_LIMIT) {
-        return { allowed: false, reason: "IP_LIMIT", count: ipRows.length, limit: DEMO_IP_HOURLY_LIMIT };
-      }
-    }
-
     const globalRows = await fetchRateLimitRows(globalBucket, dayStartIso);
     if (!Array.isArray(globalRows)) return { allowed: false, reason: "RATE_LIMIT_DB_READ", count: -1, limit: DEMO_GLOBAL_DAILY_LIMIT };
     if (globalRows.length >= DEMO_GLOBAL_DAILY_LIMIT) {
@@ -455,8 +405,6 @@ async function checkRateLimit(options = {}) {
       { owner_id: sessionBucket, called_at: new Date(now).toISOString() },
       { owner_id: globalBucket, called_at: new Date(now).toISOString() },
     ];
-    if (ipBucket) writeRows.push({ owner_id: ipBucket, called_at: new Date(now).toISOString() });
-
     const writeRes = await writeRateLimitRows(writeRows);
     if (!writeRes.ok) {
       console.error("Rate limit write failed — status:", writeRes.status);
@@ -467,7 +415,7 @@ async function checkRateLimit(options = {}) {
       allowed: true,
       sessionCount: sessionRows.length + 1,
       sessionLimit: DEMO_SESSION_LIMIT,
-      ipTracked: !!ipBucket,
+      ipTracked: false,
       globalCount: globalRows.length + 1,
       globalLimit: DEMO_GLOBAL_DAILY_LIMIT,
     };
