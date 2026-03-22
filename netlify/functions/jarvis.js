@@ -53,6 +53,12 @@ const DEMO_IP_HOURLY_LIMIT = parseInt(process.env.DEMO_IP_HOURLY_LIMIT || String
 const DEMO_COOLDOWN_SECONDS = parseInt(process.env.DEMO_COOLDOWN_SECONDS || "10", 10);
 const DEMO_GLOBAL_DAILY_LIMIT = parseInt(process.env.DEMO_GLOBAL_DAILY_LIMIT || "100", 10);
 
+// Deploy 8: in-memory guest cooldown fallback.
+// If the DB-backed demo limiter read/write path fails, keep funded guest turns
+// usable but still enforce a simple same-session cooldown in server memory.
+const guestCooldownMemory = new Map();
+const GUEST_COOLDOWN_MEMORY_TTL_MS = Math.max(DEMO_COOLDOWN_SECONDS, 10) * 60 * 1000;
+
 // FIX 3: Startup config validation.
 // If any required env var is missing, crash immediately with a clear
 // message instead of booting and failing silently later with cryptic errors.
@@ -372,14 +378,72 @@ async function writeRateLimitRows(rows) {
   return writeRes;
 }
 
+function pruneGuestCooldownMemory(now = Date.now()) {
+  for (const [key, value] of guestCooldownMemory.entries()) {
+    if (!value || (now - value.lastSeenAt) > GUEST_COOLDOWN_MEMORY_TTL_MS) {
+      guestCooldownMemory.delete(key);
+    }
+  }
+}
+
+function markGuestCooldownFallback(sessionId, now = Date.now()) {
+  if (!sessionId) return;
+  pruneGuestCooldownMemory(now);
+  guestCooldownMemory.set(sessionId, { lastSeenAt: now });
+}
+
+function getGuestCooldownFallbackResult(sessionId, now = Date.now()) {
+  if (!sessionId) return { allowed: true, fallbackActive: false };
+
+  pruneGuestCooldownMemory(now);
+
+  const existing = guestCooldownMemory.get(sessionId);
+  const cooldownMs = DEMO_COOLDOWN_SECONDS * 1000;
+  if (existing && (now - existing.lastSeenAt) < cooldownMs) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((cooldownMs - (now - existing.lastSeenAt)) / 1000));
+    return {
+      allowed: false,
+      reason: "COOLDOWN",
+      limit: 1,
+      count: 1,
+      retryAfterSeconds,
+      fallbackActive: true,
+      limiterWarning: "RATE_LIMIT_MEMORY_FALLBACK",
+    };
+  }
+
+  guestCooldownMemory.set(sessionId, { lastSeenAt: now });
+  return {
+    allowed: true,
+    fallbackActive: true,
+    limiterWarning: "RATE_LIMIT_MEMORY_FALLBACK",
+  };
+}
+
 // ── Rate Limiting ─────────────────────────────────────────────
 async function checkRateLimit(options = {}) {
   if (options.isAdmin) return { allowed: true, bypassed: true };
 
-  try {
-    const sessionId = options.sessionId || crypto.randomUUID();
+  const sessionId = options.sessionId || crypto.randomUUID();
+  const now = Date.now();
 
-    const now = Date.now();
+  const applyGuestCooldownFallback = (warningCode, extra = {}) => {
+    const fallback = getGuestCooldownFallbackResult(sessionId, now);
+    if (!fallback.allowed) return fallback;
+
+    return {
+      allowed: true,
+      sessionCount: extra.sessionCount,
+      sessionLimit: extra.sessionLimit,
+      ipTracked: false,
+      globalCount: extra.globalCount,
+      globalLimit: extra.globalLimit,
+      limiterWarning: warningCode || fallback.limiterWarning,
+      cooldownFallbackActive: true,
+    };
+  };
+
+  try {
     const dayStartIso = new Date(now - 24 * 60 * 60 * 1000).toISOString();
     const cooldownStartIso = new Date(now - DEMO_COOLDOWN_SECONDS * 1000).toISOString();
 
@@ -388,8 +452,8 @@ async function checkRateLimit(options = {}) {
 
     const sessionRows = await fetchRateLimitRows(sessionBucket, dayStartIso);
     if (!Array.isArray(sessionRows)) {
-      console.warn("Rate limit read failed for session bucket — allowing request.");
-      return { allowed: true, limiterWarning: "RATE_LIMIT_DB_READ_SESSION", ipTracked: false };
+      console.warn("Rate limit read failed for session bucket — using memory cooldown fallback.");
+      return applyGuestCooldownFallback("RATE_LIMIT_DB_READ_SESSION");
     }
     if (sessionRows.length >= DEMO_SESSION_LIMIT) {
       return { allowed: false, reason: "SESSION_LIMIT", count: sessionRows.length, limit: DEMO_SESSION_LIMIT };
@@ -402,14 +466,11 @@ async function checkRateLimit(options = {}) {
 
     const globalRows = await fetchRateLimitRows(globalBucket, dayStartIso);
     if (!Array.isArray(globalRows)) {
-      console.warn("Rate limit read failed for global bucket — allowing request.");
-      return {
-        allowed: true,
+      console.warn("Rate limit read failed for global bucket — using memory cooldown fallback.");
+      return applyGuestCooldownFallback("RATE_LIMIT_DB_READ_GLOBAL", {
         sessionCount: sessionRows.length + 1,
         sessionLimit: DEMO_SESSION_LIMIT,
-        ipTracked: false,
-        limiterWarning: "RATE_LIMIT_DB_READ_GLOBAL",
-      };
+      });
     }
     if (globalRows.length >= DEMO_GLOBAL_DAILY_LIMIT) {
       return { allowed: false, reason: "GLOBAL_DAILY_LIMIT", count: globalRows.length, limit: DEMO_GLOBAL_DAILY_LIMIT };
@@ -421,17 +482,16 @@ async function checkRateLimit(options = {}) {
     ];
     const writeRes = await writeRateLimitRows(writeRows);
     if (!writeRes.ok) {
-      console.error("Rate limit write failed — status:", writeRes.status, "— allowing request.");
-      return {
-        allowed: true,
+      console.error("Rate limit write failed — status:", writeRes.status, "— using memory cooldown fallback.");
+      return applyGuestCooldownFallback("RATE_LIMIT_DB_WRITE", {
         sessionCount: sessionRows.length + 1,
         sessionLimit: DEMO_SESSION_LIMIT,
-        ipTracked: false,
         globalCount: globalRows.length + 1,
         globalLimit: DEMO_GLOBAL_DAILY_LIMIT,
-        limiterWarning: "RATE_LIMIT_DB_WRITE",
-      };
+      });
     }
+
+    markGuestCooldownFallback(sessionId, now);
 
     return {
       allowed: true,
@@ -442,8 +502,8 @@ async function checkRateLimit(options = {}) {
       globalLimit: DEMO_GLOBAL_DAILY_LIMIT,
     };
   } catch (e) {
-    console.error("Rate limit check error:", e?.message, "— allowing request.");
-    return { allowed: true, limiterWarning: "RATE_LIMIT_DB_ERROR", ipTracked: false };
+    console.error("Rate limit check error:", e?.message, "— using memory cooldown fallback.");
+    return applyGuestCooldownFallback("RATE_LIMIT_DB_ERROR");
   }
 }
 
