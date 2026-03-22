@@ -319,6 +319,42 @@ function getHeader(headers, key) {
   return "";
 }
 
+function normalizeIp(raw) {
+  if (!raw) return "";
+  const first = String(raw).split(",")[0].trim().toLowerCase();
+  if (!first || first === "unknown" || first === "null") return "";
+  return first.startsWith("::ffff:") ? first.slice(7) : first;
+}
+
+function isTrustedPublicIp(ip) {
+  if (!ip) return false;
+  if (ip === "localhost" || ip === "::1") return false;
+
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) {
+    const parts = ip.split(".").map(n => parseInt(n, 10));
+    if (parts.some(n => Number.isNaN(n) || n < 0 || n > 255)) return false;
+
+    const [a, b] = parts;
+    if (a === 10) return false;
+    if (a === 127) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 169 && b === 254) return false;
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false; // carrier-grade NAT / shared
+    if (a === 0) return false;
+    return true;
+  }
+
+  if (ip.includes(":")) {
+    if (ip.startsWith("fc") || ip.startsWith("fd")) return false; // unique local
+    if (ip.startsWith("fe80:")) return false; // link-local
+    if (ip === "::") return false;
+    return /^[0-9a-f:]+$/i.test(ip);
+  }
+
+  return false;
+}
+
 function getClientIp(meta = {}) {
   const headers = meta.headers || {};
   const candidates = [
@@ -330,9 +366,9 @@ function getClientIp(meta = {}) {
   ];
 
   for (const raw of candidates) {
-    if (!raw) continue;
-    const ip = String(raw).split(",")[0].trim();
-    if (ip) return ip;
+    const ip = normalizeIp(raw);
+    if (!ip) continue;
+    if (isTrustedPublicIp(ip)) return ip;
   }
   return "";
 }
@@ -377,6 +413,9 @@ async function checkRateLimit(options = {}) {
     const sessionId = options.sessionId || crypto.randomUUID();
     const clientIp = getClientIp(options.requestMeta || {});
     const ipHash = hashIp(clientIp);
+    if (!ipHash) {
+      console.log(JSON.stringify({ event: "RATE_LIMIT_IP_SKIPPED", reason: "NO_TRUSTED_PUBLIC_IP" }));
+    }
 
     const now = Date.now();
     const hourStartIso = new Date(now - 60 * 60 * 1000).toISOString();
