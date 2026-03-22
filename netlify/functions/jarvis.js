@@ -370,6 +370,15 @@ function detectQueryType(question) {
     return "factual";
   }
 
+  // Narrow natural-language arithmetic fast-path:
+  // classify only simple two-operand expressions like "2 plus 2" or
+  // "12 divided by 3" as factual. Keep this anchored and operator-limited
+  // so ordinary prompts containing numbers are not misrouted.
+  const naturalLanguageArithmeticPattern = /^\s*-?\d+(?:\.\d+)?\s+(?:plus|minus|times|divided by)\s+-?\d+(?:\.\d+)?\s*$/;
+  if (q && naturalLanguageArithmeticPattern.test(q)) {
+    return "factual";
+  }
+
   const factualPatterns = [
     /^who (is|was|are|were)/,/^what is\b/,/^what was\b/,/^when (is|was|did|were)/,
     /^where (is|was|are|were)/,/^how (many|much|old|tall|far|long|big)/,
