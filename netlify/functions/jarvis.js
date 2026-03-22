@@ -39,6 +39,7 @@ const SUPA_URL            = process.env.SUPABASE_URL;
 const SUPA_KEY            = process.env.SUPABASE_SERVICE_KEY;
 const ALLOWED_ORIGIN      = process.env.ALLOWED_ORIGIN || "https://jarvis-ai-arena.netlify.app";
 const RATE_LIMIT_PER_HOUR = parseInt(process.env.RATE_LIMIT_PER_HOUR || "30", 10);
+const ADMIN_DEMO_SECRET   = process.env.ADMIN_DEMO_SECRET || "";
 
 // FIX 3: Startup config validation.
 // If any required env var is missing, crash immediately with a clear
@@ -256,18 +257,22 @@ function respond(statusCode, body, headers) {
 }
 
 // ── Token Auth ────────────────────────────────────────────────
-function createToken() {
+function createToken(options = {}) {
   const expires = Date.now() + 24 * 60 * 60 * 1000;
-  const payload = Buffer.from(JSON.stringify({ expires, owner: OWNER_ID })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({
+    expires,
+    owner: OWNER_ID,
+    isAdmin: options.isAdmin === true,
+  })).toString("base64url");
   const sig = crypto.createHmac("sha256", JARVIS_SECRET).update(payload).digest("base64url");
   return `${payload}.${sig}`;
 }
 
-function verifyToken(token) {
+function readToken(token) {
   try {
-    if (!token) return false;
+    if (!token) return null;
     const dot = token.lastIndexOf(".");
-    if (dot === -1) return false;
+    if (dot === -1) return null;
     const payload = token.slice(0, dot);
     const sig = token.slice(dot + 1);
     const expectedSig = crypto.createHmac("sha256", JARVIS_SECRET).update(payload).digest("base64url");
@@ -276,15 +281,25 @@ function verifyToken(token) {
     // on malformed tokens. Length check first, comparison second.
     const sigBuf      = Buffer.from(sig);
     const expectedBuf = Buffer.from(expectedSig);
-    if (sigBuf.length !== expectedBuf.length) return false;
-    if (!crypto.timingSafeEqual(sigBuf, expectedBuf)) return false;
-    const { expires } = JSON.parse(Buffer.from(payload, "base64url").toString());
-    return Date.now() < expires;
-  } catch { return false; }
+    if (sigBuf.length !== expectedBuf.length) return null;
+    if (!crypto.timingSafeEqual(sigBuf, expectedBuf)) return null;
+    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString());
+    if (!decoded || Date.now() >= decoded.expires) return null;
+    return {
+      owner: decoded.owner || OWNER_ID,
+      isAdmin: decoded.isAdmin === true,
+      expires: decoded.expires,
+    };
+  } catch { return null; }
+}
+
+function verifyToken(token) {
+  return !!readToken(token);
 }
 
 // ── Rate Limiting ─────────────────────────────────────────────
-async function checkRateLimit() {
+async function checkRateLimit(options = {}) {
+  if (options.isAdmin) return { allowed: true, bypassed: true };
   try {
     const windowStart = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     const countRes = await fetch(
@@ -1056,15 +1071,27 @@ exports.handler = async function (event) {
   try { body = JSON.parse(event.body); }
   catch { log("INVALID_JSON"); return respond(400, { error: "Invalid JSON" }, corsHeaders); }
 
-  const { action, pin, token, question, fileText, historyId, threadId, forcedMode, intentMode: rawIntentMode } = body;
+  const { action, pin, token, question, fileText, historyId, threadId, forcedMode, intentMode: rawIntentMode, adminSecret } = body;
   log("RECEIVED", { action });
+
+  if (action === "create_guest_session") {
+    return respond(200, { token: createToken(), isAdmin: false }, corsHeaders);
+  }
+
+  if (action === "create_admin_session") {
+    if (!ADMIN_DEMO_SECRET || !adminSecret || adminSecret !== ADMIN_DEMO_SECRET) {
+      return respond(403, { error: "ADMIN ACCESS DENIED" }, corsHeaders);
+    }
+    return respond(200, { token: createToken({ isAdmin: true }), isAdmin: true }, corsHeaders);
+  }
 
   if (action === "verify_pin") {
     if (!pin || pin !== JARVIS_PIN) return respond(200, { valid: false }, corsHeaders);
-    return respond(200, { valid: true, token: createToken() }, corsHeaders);
+    return respond(200, { valid: true, token: createToken(), isAdmin: false }, corsHeaders);
   }
 
-  if (!verifyToken(token)) return respond(401, { error: "UNAUTHORIZED — SESSION EXPIRED OR INVALID" }, corsHeaders);
+  const session = readToken(token);
+  if (!session) return respond(401, { error: "UNAUTHORIZED — SESSION EXPIRED OR INVALID" }, corsHeaders);
 
   if (action === "load_history") return respond(200, { history: await loadHistory() }, corsHeaders);
   if (action === "load_thread") return respond(200, { turns: await loadThread(threadId) }, corsHeaders);
@@ -1074,7 +1101,7 @@ exports.handler = async function (event) {
   if (action === "analyze") {
     if (!question && !fileText) return respond(400, { error: "No question provided" }, corsHeaders);
 
-    const rl = await checkRateLimit();
+    const rl = await checkRateLimit({ isAdmin: session.isAdmin });
     if (!rl.allowed) return respond(429, { error: `RATE LIMIT EXCEEDED — ${rl.count ?? "?"}/${rl.limit ?? RATE_LIMIT_PER_HOUR} calls this hour. Try again later.` }, corsHeaders);
 
     const activeThreadId = threadId || crypto.randomUUID();
@@ -1417,10 +1444,11 @@ exports.streamHandler = async function(body, send) {
     const { token, question, fileText, threadId, forcedMode, intentMode: rawIntentMode } = body;
     phaseLog("STREAM_START", { threadId: threadId || null, forcedMode: forcedMode || null });
 
-    if (!verifyToken(token)) { safeSend("error", { message: "UNAUTHORIZED" }); return; }
+    const session = readToken(token);
+    if (!session) { safeSend("error", { message: "UNAUTHORIZED" }); return; }
     if (!question && !fileText) { safeSend("error", { message: "No question provided" }); return; }
 
-    const rl = await checkRateLimit();
+    const rl = await checkRateLimit({ isAdmin: session.isAdmin });
     if (!rl.allowed) {
       safeSend("error", { message: `RATE LIMIT EXCEEDED — ${rl.count ?? "?"}/${rl.limit ?? RATE_LIMIT_PER_HOUR} calls this hour.` });
       return;

@@ -392,6 +392,8 @@
   <script type="text/babel">
     const { useState, useRef, useEffect, useCallback } = React;
 
+    const ADMIN_TOGGLE_KEY = "jarvis_admin_secret";
+
     const AGENT_UI = [
       { key:"analyst",  name:"ANALYST",   company:"OPENAI · GPT-4O MINI",        color:"#ffc844", avatar:"AN", bg:"rgba(30,18,0,0.7)"  },
       { key:"adversary",name:"ADVERSARY", company:"DEEPSEEK · CHAT V3",          color:"#00d4ff", avatar:"AV", bg:"rgba(0,18,28,0.7)"  },
@@ -425,6 +427,9 @@
     function getToken() { try { return localStorage.getItem("jarvis_token"); } catch { return null; } }
     function setToken(t) { try { localStorage.setItem("jarvis_token", t); } catch {} }
     function clearToken() { try { localStorage.removeItem("jarvis_token"); localStorage.removeItem("jarvis_pin_ok"); } catch {} }
+    function getAdminSecret() { try { return localStorage.getItem(ADMIN_TOGGLE_KEY); } catch { return null; } }
+    function setAdminSecret(secret) { try { localStorage.setItem(ADMIN_TOGGLE_KEY, secret); } catch {} }
+    function clearAdminSecret() { try { localStorage.removeItem(ADMIN_TOGGLE_KEY); } catch {} }
     function getOnboardDone() { try { return localStorage.getItem("jarvis_onboard_done"); } catch { return null; } }
     function setOnboardDone() { try { localStorage.setItem("jarvis_onboard_done", "1"); } catch {} }
 
@@ -432,7 +437,13 @@
     async function createGuestSession() {
       const result = await callJarvis({ action: "create_guest_session" });
       if (!result || !result.token) throw new Error("Guest session was not created.");
-      return result.token;
+      return { token: result.token, isAdmin: !!result.isAdmin };
+    }
+
+    async function createAdminSession(adminSecret) {
+      const result = await callJarvis({ action: "create_admin_session", adminSecret });
+      if (!result || !result.token) throw new Error("Admin session was not created.");
+      return { token: result.token, isAdmin: !!result.isAdmin };
     }
 
     // ── Guest Session Gate ─────────────────────────────────────
@@ -445,9 +456,13 @@
 
         (async () => {
           try {
-            const token = await createGuestSession();
-            setToken(token);
-            if (!cancelled) onReady(token);
+            const storedAdminSecret = getAdminSecret();
+            const session = storedAdminSecret
+              ? await createAdminSession(storedAdminSecret).catch(() => null)
+              : null;
+            const nextSession = session || await createGuestSession();
+            setToken(nextSession.token);
+            if (!cancelled) onReady(nextSession.token, !!nextSession.isAdmin);
           } catch (err) {
             if (cancelled) return;
             setErrorText("⚠ DEMO BACKEND UNAVAILABLE");
@@ -464,7 +479,7 @@
             <div className="pin-title">J.A.R.V.I.S</div>
             <div className="pin-sub">PUBLIC DEMO ACCESS</div>
             <div style={{color:"#c8b89a",fontSize:11,lineHeight:1.8,marginBottom:18}}>
-              Launching a temporary guest session so anyone can use the demo immediately.
+              {getAdminSecret() ? "Attempting admin session..." : "Launching a temporary guest session so anyone can use the demo immediately."}
             </div>
             <div style={{color:errorText ? "#ff6b6b" : "#00e8ff",fontSize:11,letterSpacing:"0.12em"}}>
               {errorText || statusText}
@@ -710,8 +725,9 @@
     }
 
     // ── Main Interface ─────────────────────────────────────────
-    function JarvisInterface({ token: initialToken }) {
+    function JarvisInterface({ token: initialToken, isAdmin: initialIsAdmin = false }) {
       const [tokenState, setTokenState] = useState(initialToken);
+      const [isAdmin, setIsAdmin] = useState(initialIsAdmin);
       const [q, setQ] = useState("");
       const [txHeight, setTxHeight] = useState(38);
       const [active, setActive] = useState(false);
@@ -765,10 +781,50 @@
       useEffect(() => { resizeTextarea(); }, [q]);
       const scrollAreaRef = useRef(null);
 
+      const loadHist = useCallback(() => {
+        callJarvis({ action: "load_history", token: tokenState })
+          .then(r => setHistory(Array.isArray(r.history) ? r.history : []))
+          .catch(e => {
+            if (e.message.includes("401") || e.message.includes("UNAUTHORIZED")) {
+              clearToken(); setTokenState(null); setIsAdmin(false);
+            }
+          });
+      }, [tokenState]);
+
       useEffect(() => {
         const t = setInterval(() => setTime(new Date()), 1000);
         return () => clearInterval(t);
       }, []);
+
+      useEffect(() => {
+        const handleAdminShortcut = async (e) => {
+          if (!e.ctrlKey || !e.shiftKey) return;
+          if (e.key === "A" || e.key === "a") {
+            e.preventDefault();
+            const nextSecret = window.prompt("Enter admin demo secret");
+            if (!nextSecret) return;
+            try {
+              const session = await createAdminSession(nextSecret.trim());
+              setAdminSecret(nextSecret.trim());
+              setToken(session.token);
+              setTokenState(session.token);
+              setIsAdmin(!!session.isAdmin);
+              loadHist();
+            } catch (err) {
+              window.alert("Admin access denied.");
+            }
+          }
+          if (e.key === "X" || e.key === "x") {
+            e.preventDefault();
+            clearAdminSecret();
+            clearToken();
+            setTokenState(null);
+            setIsAdmin(false);
+          }
+        };
+        window.addEventListener("keydown", handleAdminShortcut);
+        return () => window.removeEventListener("keydown", handleAdminShortcut);
+      }, [loadHist]);
 
       useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [synth, active, quorumFailed, messages.length]);
 
@@ -783,17 +839,7 @@
 
       const scrollToTop = () => scrollAreaRef.current?.scrollTo({ top: 0, behavior: "smooth" });
 
-      const loadHist = () => {
-        callJarvis({ action: "load_history", token: tokenState })
-          .then(r => setHistory(Array.isArray(r.history) ? r.history : []))
-          .catch(e => {
-            if (e.message.includes("401") || e.message.includes("UNAUTHORIZED")) {
-              clearToken(); setTokenState(null);
-            }
-          });
-      };
-
-      useEffect(() => { loadHist(); }, []);
+      useEffect(() => { loadHist(); }, [loadHist]);
 
       const processFile = async (file) => {
         const maxChars = 12000;
@@ -899,7 +945,7 @@
                 // keepalive — no UI action
               } else if (eventName === "error") {
                 if (data.message && (data.message.includes("401") || data.message.includes("UNAUTHORIZED"))) {
-                  clearToken(); setTokenState(null);
+                  clearToken(); setTokenState(null); setIsAdmin(false);
                 } else {
                   throw new Error(data.message || "Stream error");
                 }
@@ -924,7 +970,7 @@
           }
         } catch(e) {
           if (e.message && (e.message.includes("401") || e.message.includes("UNAUTHORIZED"))) {
-            clearToken(); setTokenState(null); return;
+            clearToken(); setTokenState(null); setIsAdmin(false); return;
           }
           setError("Connection interrupted. Partial output preserved — please retry.");
           setMessages(prev => prev.map(m => m.id === msgId ? {
@@ -1043,7 +1089,7 @@
       const selMsg = messages[selectedTurn];
       const debateBlocks = selMsg?.debateOutputs || [];
 
-      if (!tokenState) return <GuestSessionGate onReady={(t) => { setTokenState(t); }} />;
+      if (!tokenState) return <GuestSessionGate onReady={(t, admin = false) => { setTokenState(t); setIsAdmin(!!admin); }} />;
 
       // Mobile drawer content
       const mobileDrawerContent = () => {
@@ -1162,7 +1208,7 @@
           {/* Header */}
           <div className="hud-header">
             <div className="header-rail header-rail-left">
-              <div className="status-inline"><span className="status-dot"/>ONLINE</div>
+              <div className="status-inline"><span className="status-dot"/>ONLINE {isAdmin ? "· ADMIN" : "· DEMO"}</div>
               <button className={`panel-toggle-btn ${threadsOpen?"on":""}`} onClick={() => setThreadsOpen(v=>!v)}>◈ THREADS</button>
             </div>
             <div className="header-brand">
@@ -1503,10 +1549,11 @@
 
     // ── App Root ───────────────────────────────────────────────
     function App() {
-      const [token, setToken] = useState(() => getToken());
+      const [token, setTokenState] = useState(() => getToken());
+      const [isAdmin, setIsAdmin] = useState(() => !!getAdminSecret());
       return token
-        ? React.createElement(JarvisInterface, { token, key: token })
-        : React.createElement(GuestSessionGate, { onReady: (t) => { setToken(t); } });
+        ? React.createElement(JarvisInterface, { token, isAdmin, key: token })
+        : React.createElement(GuestSessionGate, { onReady: (t, admin = false) => { setTokenState(t); setIsAdmin(!!admin); } });
     }
 
     ReactDOM.render(React.createElement(App), document.getElementById("root"));
