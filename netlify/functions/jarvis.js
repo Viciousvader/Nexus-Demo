@@ -256,18 +256,11 @@ function respond(statusCode, body, headers) {
 }
 
 // ── Token Auth ────────────────────────────────────────────────
-function createToken(extraClaims = {}) {
+function createToken() {
   const expires = Date.now() + 24 * 60 * 60 * 1000;
-  const payload = Buffer.from(JSON.stringify({ expires, owner: OWNER_ID, ...extraClaims })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ expires, owner: OWNER_ID })).toString("base64url");
   const sig = crypto.createHmac("sha256", JARVIS_SECRET).update(payload).digest("base64url");
   return `${payload}.${sig}`;
-}
-
-function createGuestSessionToken() {
-  return createToken({
-    mode: "guest",
-    guestId: crypto.randomUUID(),
-  });
 }
 
 function verifyToken(token) {
@@ -364,7 +357,18 @@ function detectIntentMode(question) {
 }
 
 function detectQueryType(question) {
-  const q = (question || "").toLowerCase();
+  const q = (question || "").toLowerCase().trim();
+
+  // Narrow arithmetic fast-path:
+  // classify obviously math-only expressions like "2+2", "15 / 3", or "(2+3)*4"
+  // as factual so AUTO mode does not waste a full swarm pass on trivial arithmetic.
+  // Keep this conservative to avoid catching normal text that merely contains numbers.
+  const bareArithmeticPattern = /^[\d\s()+\-*/%.]+$/;
+  const containsOperator = /[+\-*/%]/;
+  const hasDigit = /\d/;
+  if (q && bareArithmeticPattern.test(q) && containsOperator.test(q) && hasDigit.test(q)) {
+    return "factual";
+  }
 
   const factualPatterns = [
     /^who (is|was|are|were)/,/^what is\b/,/^what was\b/,/^when (is|was|did|were)/,
@@ -1045,10 +1049,6 @@ exports.handler = async function (event) {
 
   const { action, pin, token, question, fileText, historyId, threadId, forcedMode, intentMode: rawIntentMode } = body;
   log("RECEIVED", { action });
-
-  if (action === "create_guest_session") {
-    return respond(200, { ok: true, token: createGuestSessionToken(), mode: "guest" }, corsHeaders);
-  }
 
   if (action === "verify_pin") {
     if (!pin || pin !== JARVIS_PIN) return respond(200, { valid: false }, corsHeaders);
