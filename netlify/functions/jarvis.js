@@ -20,6 +20,9 @@
 // Fix 6 (Deploy 6): added request ID logging to exports.handler so
 //   every request gets a unique trace ID in Railway logs.
 // ============================================================
+// Fix 7 (Deploy 7): demo limiter fail-open on DB errors. Real named limits
+//   still enforce when reads succeed, but Supabase rate-limit read/write failures
+//   now allow the request instead of blocking first-time demo users.
 
 // ── Environment Variables ─────────────────────────────────────
 // OPENROUTER_API_KEY   — Your OpenRouter API key
@@ -377,7 +380,6 @@ async function checkRateLimit(options = {}) {
     const sessionId = options.sessionId || crypto.randomUUID();
 
     const now = Date.now();
-    const hourStartIso = new Date(now - 60 * 60 * 1000).toISOString();
     const dayStartIso = new Date(now - 24 * 60 * 60 * 1000).toISOString();
     const cooldownStartIso = new Date(now - DEMO_COOLDOWN_SECONDS * 1000).toISOString();
 
@@ -385,7 +387,10 @@ async function checkRateLimit(options = {}) {
     const globalBucket = buildRateBucket("g", "funded");
 
     const sessionRows = await fetchRateLimitRows(sessionBucket, dayStartIso);
-    if (!Array.isArray(sessionRows)) return { allowed: false, reason: "RATE_LIMIT_DB_READ", count: -1, limit: DEMO_SESSION_LIMIT };
+    if (!Array.isArray(sessionRows)) {
+      console.warn("Rate limit read failed for session bucket — allowing request.");
+      return { allowed: true, limiterWarning: "RATE_LIMIT_DB_READ_SESSION", ipTracked: false };
+    }
     if (sessionRows.length >= DEMO_SESSION_LIMIT) {
       return { allowed: false, reason: "SESSION_LIMIT", count: sessionRows.length, limit: DEMO_SESSION_LIMIT };
     }
@@ -396,7 +401,16 @@ async function checkRateLimit(options = {}) {
     }
 
     const globalRows = await fetchRateLimitRows(globalBucket, dayStartIso);
-    if (!Array.isArray(globalRows)) return { allowed: false, reason: "RATE_LIMIT_DB_READ", count: -1, limit: DEMO_GLOBAL_DAILY_LIMIT };
+    if (!Array.isArray(globalRows)) {
+      console.warn("Rate limit read failed for global bucket — allowing request.");
+      return {
+        allowed: true,
+        sessionCount: sessionRows.length + 1,
+        sessionLimit: DEMO_SESSION_LIMIT,
+        ipTracked: false,
+        limiterWarning: "RATE_LIMIT_DB_READ_GLOBAL",
+      };
+    }
     if (globalRows.length >= DEMO_GLOBAL_DAILY_LIMIT) {
       return { allowed: false, reason: "GLOBAL_DAILY_LIMIT", count: globalRows.length, limit: DEMO_GLOBAL_DAILY_LIMIT };
     }
@@ -407,8 +421,16 @@ async function checkRateLimit(options = {}) {
     ];
     const writeRes = await writeRateLimitRows(writeRows);
     if (!writeRes.ok) {
-      console.error("Rate limit write failed — status:", writeRes.status);
-      return { allowed: false, reason: "RATE_LIMIT_DB_WRITE", count: sessionRows.length, limit: DEMO_SESSION_LIMIT };
+      console.error("Rate limit write failed — status:", writeRes.status, "— allowing request.");
+      return {
+        allowed: true,
+        sessionCount: sessionRows.length + 1,
+        sessionLimit: DEMO_SESSION_LIMIT,
+        ipTracked: false,
+        globalCount: globalRows.length + 1,
+        globalLimit: DEMO_GLOBAL_DAILY_LIMIT,
+        limiterWarning: "RATE_LIMIT_DB_WRITE",
+      };
     }
 
     return {
@@ -420,9 +442,8 @@ async function checkRateLimit(options = {}) {
       globalLimit: DEMO_GLOBAL_DAILY_LIMIT,
     };
   } catch (e) {
-    // FIX 4: fail-closed on any DB error — deny rather than allow
-    console.error("Rate limit check error:", e?.message);
-    return { allowed: false, reason: "RATE_LIMIT_DB_ERROR", count: -1, limit: DEMO_SESSION_LIMIT };
+    console.error("Rate limit check error:", e?.message, "— allowing request.");
+    return { allowed: true, limiterWarning: "RATE_LIMIT_DB_ERROR", ipTracked: false };
   }
 }
 
