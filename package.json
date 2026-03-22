@@ -1,0 +1,12 @@
+{
+  "name": "jarvis-backend",
+  "version": "1.0.0",
+  "description": "J.A.R.V.I.S Sovereign Swarm Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
