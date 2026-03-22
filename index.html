@@ -900,57 +900,81 @@
             }),
           });
 
-          if (!streamRes.ok) throw new Error(`HTTP ${streamRes.status}`);
+          if (!streamRes.ok) {
+            const err = await streamRes.json().catch(async () => {
+              const text = await streamRes.text().catch(() => "");
+              return { error: text || `HTTP ${streamRes.status}` };
+            });
+            throw new Error(err.error || err.message || `HTTP ${streamRes.status}`);
+          }
 
           const reader = streamRes.body.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
           let currentEvent = null;
+          let streamEndedWithError = false;
+          let shouldResetSession = false;
+
+          const surfaceStreamError = (message) => {
+            const nextMessage = message || "Connection interrupted. Partial output preserved — please retry.";
+            setError(nextMessage);
+            setSeqStatus({});
+            setMessages(prev => prev.map(m => m.id === msgId ? {
+              ...m, pending: false, error: nextMessage
+            } : m));
+          };
 
           const handleSSEEvent = (eventName, dataStr) => {
+            let data = {};
             try {
-              const data = JSON.parse(dataStr);
-              if (eventName === "agent_start") {
-                setSeqStatus(prev => ({ ...prev, [data.agent]: "processing" }));
-              } else if (eventName === "agent_done") {
-                setSeqStatus(prev => ({ ...prev, [data.agent]: "complete" }));
-                if (data.status) setAgentStatuses(prev => ({ ...prev, [data.agent]: data.status }));
-              } else if (eventName === "complete") {
-                setSeqStatus({});
-                setAgentStatuses(data.agentStatuses || {});
-                setDebateOutputs(data.debateOutputs || []);
-                if (data.quorumFailed) {
-                  setQuorumFailed(true);
-                  setQuorumMessage(data.message || "QUORUM FAILURE — Insufficient agent responses.");
-                  setMessages(prev => prev.map(m => m.id === msgId ? {
-                    ...m, pending: false, quorumFailed: true,
-                    quorumMessage: data.message || "", agentStatuses: data.agentStatuses || {},
-                    debateOutputs: data.debateOutputs || [],
-                  } : m));
-                } else {
-                  setConfidence(data.confidence || null);
-                  setSynth(data.synthesis || "SYNTHESIS UNAVAILABLE.");
-                  if (data.threadId) setThreadId(data.threadId);
-                  setMessages(prev => prev.map(m => m.id === msgId ? {
-                    ...m, pending: false,
-                    synth: data.synthesis || null,
-                    confidence: data.confidence || null,
-                    agentStatuses: data.agentStatuses || {},
-                    debateOutputs: data.debateOutputs || [],
-                  } : m));
-                  setSelectedTurn(messages.length);
-                  loadHist();
-                }
-              } else if (eventName === "heartbeat") {
-                // keepalive — no UI action
-              } else if (eventName === "error") {
-                if (data.message && (data.message.includes("401") || data.message.includes("UNAUTHORIZED"))) {
-                  clearToken(); setTokenState(null); setIsAdmin(false);
-                } else {
-                  throw new Error(data.message || "Stream error");
-                }
+              data = JSON.parse(dataStr);
+            } catch {
+              return;
+            }
+
+            if (eventName === "agent_start") {
+              setSeqStatus(prev => ({ ...prev, [data.agent]: "processing" }));
+            } else if (eventName === "agent_done") {
+              setSeqStatus(prev => ({ ...prev, [data.agent]: "complete" }));
+              if (data.status) setAgentStatuses(prev => ({ ...prev, [data.agent]: data.status }));
+            } else if (eventName === "complete") {
+              setSeqStatus({});
+              setAgentStatuses(data.agentStatuses || {});
+              setDebateOutputs(data.debateOutputs || []);
+              if (data.quorumFailed) {
+                setQuorumFailed(true);
+                setQuorumMessage(data.message || "QUORUM FAILURE — Insufficient agent responses.");
+                setMessages(prev => prev.map(m => m.id === msgId ? {
+                  ...m, pending: false, quorumFailed: true,
+                  quorumMessage: data.message || "", agentStatuses: data.agentStatuses || {},
+                  debateOutputs: data.debateOutputs || [],
+                } : m));
+              } else {
+                setConfidence(data.confidence || null);
+                setSynth(data.synthesis || "SYNTHESIS UNAVAILABLE.");
+                if (data.threadId) setThreadId(data.threadId);
+                setMessages(prev => prev.map(m => m.id === msgId ? {
+                  ...m, pending: false,
+                  synth: data.synthesis || null,
+                  confidence: data.confidence || null,
+                  agentStatuses: data.agentStatuses || {},
+                  debateOutputs: data.debateOutputs || [],
+                } : m));
+                setSelectedTurn(messages.length);
+                loadHist();
               }
-            } catch(parseErr) {}
+            } else if (eventName === "heartbeat") {
+              // keepalive — no UI action
+            } else if (eventName === "error") {
+              const message = data.message || "Stream error";
+              if (message.includes("401") || message.includes("UNAUTHORIZED")) {
+                shouldResetSession = true;
+                streamEndedWithError = true;
+              } else {
+                streamEndedWithError = true;
+                surfaceStreamError(message);
+              }
+            }
           };
 
           while (true) {
@@ -965,16 +989,29 @@
               } else if (line.startsWith("data: ") && currentEvent) {
                 handleSSEEvent(currentEvent, line.slice(6));
                 currentEvent = null;
+                if (streamEndedWithError) break;
               }
             }
+            if (streamEndedWithError) {
+              try { await reader.cancel(); } catch {}
+              break;
+            }
+          }
+
+          if (shouldResetSession) {
+            clearToken(); setTokenState(null); setIsAdmin(false);
+            return;
           }
         } catch(e) {
           if (e.message && (e.message.includes("401") || e.message.includes("UNAUTHORIZED"))) {
             clearToken(); setTokenState(null); setIsAdmin(false); return;
           }
-          setError("Connection interrupted. Partial output preserved — please retry.");
+          const nextMessage = (!e?.message || e.message === "Failed to fetch" || /^HTTP \d+$/.test(e.message))
+            ? "Connection interrupted. Partial output preserved — please retry."
+            : e.message;
+          setError(nextMessage);
           setMessages(prev => prev.map(m => m.id === msgId ? {
-            ...m, pending: false, error: "Connection interrupted. Partial output preserved — please retry."
+            ...m, pending: false, error: nextMessage
           } : m));
         }
         setRunning(false);

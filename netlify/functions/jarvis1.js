@@ -342,6 +342,15 @@ function hashIp(ip) {
   return crypto.createHmac("sha256", JARVIS_SECRET).update(ip).digest("hex").slice(0, 24);
 }
 
+function buildRateBucket(kind, value = "") {
+  const digest = crypto
+    .createHmac("sha256", JARVIS_SECRET)
+    .update(`${OWNER_ID}|${kind}|${value}`)
+    .digest("hex")
+    .slice(0, 24);
+  return `demo:${kind}:${digest}`;
+}
+
 async function fetchRateLimitRows(ownerId, sinceIso) {
   const res = await fetch(
     `${SUPA_URL}/rest/v1/jarvis_ratelimit?owner_id=eq.${encodeURIComponent(ownerId)}&called_at=gte.${sinceIso}&select=id,called_at`,
@@ -374,9 +383,9 @@ async function checkRateLimit(options = {}) {
     const dayStartIso = new Date(now - 24 * 60 * 60 * 1000).toISOString();
     const cooldownStartIso = new Date(now - DEMO_COOLDOWN_SECONDS * 1000).toISOString();
 
-    const sessionBucket = `${OWNER_ID}:demo:session:${sessionId}`;
-    const ipBucket = ipHash ? `${OWNER_ID}:demo:ip:${ipHash}` : "";
-    const globalBucket = `${OWNER_ID}:demo:global`;
+    const sessionBucket = buildRateBucket("s", sessionId);
+    const ipBucket = ipHash ? buildRateBucket("i", ipHash) : "";
+    const globalBucket = buildRateBucket("g", "funded");
 
     const sessionRows = await fetchRateLimitRows(sessionBucket, dayStartIso);
     if (!Array.isArray(sessionRows)) return { allowed: false, reason: "RATE_LIMIT_DB_READ", count: -1, limit: DEMO_SESSION_LIMIT };
