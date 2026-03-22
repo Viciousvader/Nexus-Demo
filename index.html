@@ -121,6 +121,7 @@
     .chat-welcome{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:24px;text-align:center;padding:32px 20px;}
     .chat-welcome-title{font-family:'Orbitron',sans-serif;font-size:11px;color:#00d4ff;letter-spacing:0.3em;opacity:0.7;}
     .chat-welcome-sub{font-size:11px;color:#445566;letter-spacing:0.06em;line-height:2;}
+    .chat-welcome-disclaimer{max-width:720px;font-size:10px;color:var(--gold);letter-spacing:0.05em;line-height:1.8;text-align:center;opacity:0.95;}
     .welcome-samples{display:flex;flex-direction:column;gap:8px;width:100%;max-width:480px;margin-top:8px;}
     .welcome-sample-btn{background:rgba(0,30,50,0.7);border:1px solid #1a4a60;color:#c8b89a;padding:10px 16px;border-radius:3px;font-family:'Share Tech Mono',monospace;font-size:11px;cursor:pointer;transition:all 0.2s;letter-spacing:0.04em;text-align:left;}
     .welcome-sample-btn:hover{border-color:#00e8ff;color:#00e8ff;background:rgba(0,232,255,0.06);}
@@ -1353,6 +1354,9 @@
                     <div className="chat-welcome-title">◈ SOVEREIGN SWARM INTELLIGENCE ◈</div>
                     <div className="chat-welcome-sub">
                       Ask anything. The swarm debates. JARVIS synthesizes.
+                    </div>
+                    <div className="chat-welcome-disclaimer">
+                      Demo conversations may be temporarily stored for thread continuity and auto-deleted within 24 hours. Do not enter sensitive personal information.
                     </div>
                     <div className="welcome-samples">
                       {SAMPLES.map((s, i) => (
