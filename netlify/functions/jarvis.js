@@ -1113,8 +1113,12 @@ ${safe}
 }
 
 // ── Supabase Helpers ──────────────────────────────────────────
-async function saveHistory(question, responses, synthesis, confidence, threadId, turnNumber) {
+async function saveHistory(question, responses, synthesis, confidence, threadId, turnNumber, sessionId) {
   try {
+    if (!sessionId) {
+      console.error("saveHistory missing sessionId");
+      return false;
+    }
     const res = await fetch(`${SUPA_URL}/rest/v1/jarvis_history`, {
       method: "POST",
       headers: {
@@ -1123,17 +1127,27 @@ async function saveHistory(question, responses, synthesis, confidence, threadId,
         "Authorization": `Bearer ${SUPA_KEY}`,
         "Prefer": "return=minimal",
       },
-      body: JSON.stringify({ question, responses, synthesis, confidence, owner_id: OWNER_ID, thread_id: threadId, turn_number: turnNumber }),
+      body: JSON.stringify({
+        question,
+        responses,
+        synthesis,
+        confidence,
+        owner_id: OWNER_ID,
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_number: turnNumber,
+      }),
     });
     if (!res.ok) { console.error("saveHistory HTTP error:", res.status); return false; }
     return true;
   } catch (e) { console.error("Supabase save failed:", e); return false; }
 }
 
-async function fetchThreadContext(threadId) {
+async function fetchThreadContext(threadId, sessionId) {
   try {
+    if (!threadId || !sessionId) return { context: "", nextTurn: 1 };
     const res = await fetch(
-      `${SUPA_URL}/rest/v1/jarvis_history?owner_id=eq.${encodeURIComponent(OWNER_ID)}&thread_id=eq.${encodeURIComponent(threadId)}&order=turn_number.desc&limit=3`,
+      `${SUPA_URL}/rest/v1/jarvis_history?owner_id=eq.${encodeURIComponent(OWNER_ID)}&session_id=eq.${encodeURIComponent(sessionId)}&thread_id=eq.${encodeURIComponent(threadId)}&order=turn_number.desc&limit=3`,
       { headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
     );
     const rows = await res.json();
@@ -1158,10 +1172,11 @@ async function fetchThreadContext(threadId) {
   } catch { return { context: "", nextTurn: 1 }; }
 }
 
-async function loadHistory() {
+async function loadHistory(sessionId) {
   try {
+    if (!sessionId) return [];
     const res = await fetch(
-      `${SUPA_URL}/rest/v1/jarvis_history?owner_id=eq.${encodeURIComponent(OWNER_ID)}&order=created_at.desc&limit=50`,
+      `${SUPA_URL}/rest/v1/jarvis_history?owner_id=eq.${encodeURIComponent(OWNER_ID)}&session_id=eq.${encodeURIComponent(sessionId)}&order=created_at.desc&limit=50`,
       { headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
     );
     if (!res.ok) { console.error("loadHistory HTTP error:", res.status); return []; }
@@ -1170,10 +1185,11 @@ async function loadHistory() {
   } catch (e) { console.error("loadHistory error:", e?.message); return []; }
 }
 
-async function deleteHistoryItem(id) {
+async function deleteHistoryItem(id, sessionId) {
   try {
+    if (!id || !sessionId) return false;
     const res = await fetch(
-      `${SUPA_URL}/rest/v1/jarvis_history?id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(OWNER_ID)}`,
+      `${SUPA_URL}/rest/v1/jarvis_history?id=eq.${encodeURIComponent(id)}&owner_id=eq.${encodeURIComponent(OWNER_ID)}&session_id=eq.${encodeURIComponent(sessionId)}`,
       { method: "DELETE", headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
     );
     if (!res.ok) { console.error("deleteHistoryItem HTTP error:", res.status); return false; }
@@ -1181,11 +1197,11 @@ async function deleteHistoryItem(id) {
   } catch (e) { console.error("deleteHistoryItem error:", e?.message); return false; }
 }
 
-async function loadThread(threadId) {
+async function loadThread(threadId, sessionId) {
   try {
-    if (!threadId) return [];
+    if (!threadId || !sessionId) return [];
     const res = await fetch(
-      `${SUPA_URL}/rest/v1/jarvis_history?owner_id=eq.${encodeURIComponent(OWNER_ID)}&thread_id=eq.${encodeURIComponent(threadId)}&order=created_at.asc`,
+      `${SUPA_URL}/rest/v1/jarvis_history?owner_id=eq.${encodeURIComponent(OWNER_ID)}&session_id=eq.${encodeURIComponent(sessionId)}&thread_id=eq.${encodeURIComponent(threadId)}&order=created_at.asc`,
       { headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
     );
     if (!res.ok) { console.error("loadThread HTTP error:", res.status); return []; }
@@ -1194,11 +1210,11 @@ async function loadThread(threadId) {
   } catch (e) { console.error("loadThread error:", e?.message); return []; }
 }
 
-async function deleteThreadItems(threadId) {
+async function deleteThreadItems(threadId, sessionId) {
   try {
-    if (!threadId) return false;
+    if (!threadId || !sessionId) return false;
     const res = await fetch(
-      `${SUPA_URL}/rest/v1/jarvis_history?owner_id=eq.${encodeURIComponent(OWNER_ID)}&thread_id=eq.${encodeURIComponent(threadId)}`,
+      `${SUPA_URL}/rest/v1/jarvis_history?owner_id=eq.${encodeURIComponent(OWNER_ID)}&session_id=eq.${encodeURIComponent(sessionId)}&thread_id=eq.${encodeURIComponent(threadId)}`,
       { method: "DELETE", headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
     );
     if (!res.ok) { console.error("deleteThreadItems HTTP error:", res.status); return false; }
@@ -1286,10 +1302,10 @@ exports.handler = async function (event) {
   const session = readToken(token);
   if (!session) return respond(401, { error: "UNAUTHORIZED — SESSION EXPIRED OR INVALID" }, corsHeaders);
 
-  if (action === "load_history") return respond(200, { history: await loadHistory() }, corsHeaders);
-  if (action === "load_thread") return respond(200, { turns: await loadThread(threadId) }, corsHeaders);
-  if (action === "delete_history") { const ok = await deleteHistoryItem(historyId); return respond(200, { ok }, corsHeaders); }
-  if (action === "delete_thread") { const ok = await deleteThreadItems(threadId); return respond(200, { ok }, corsHeaders); }
+  if (action === "load_history") return respond(200, { history: await loadHistory(session.sessionId) }, corsHeaders);
+  if (action === "load_thread") return respond(200, { turns: await loadThread(threadId, session.sessionId) }, corsHeaders);
+  if (action === "delete_history") { const ok = await deleteHistoryItem(historyId, session.sessionId); return respond(200, { ok }, corsHeaders); }
+  if (action === "delete_thread") { const ok = await deleteThreadItems(threadId, session.sessionId); return respond(200, { ok }, corsHeaders); }
 
   if (action === "analyze") {
     if (!question && !fileText) return respond(400, { error: "No question provided" }, corsHeaders);
@@ -1306,12 +1322,12 @@ exports.handler = async function (event) {
     let turnNumber = 1;
 
     if (threadId) {
-      const { context, nextTurn } = await fetchThreadContext(threadId);
+      const { context, nextTurn } = await fetchThreadContext(threadId, session.sessionId);
       threadContext = context;
       turnNumber = nextTurn;
     }
 
-    const memoryContext = await fetchMemoryContext().catch(() => "");
+    const memoryContext = await fetchMemoryContext(session.sessionId).catch(() => "");
 
     const intentMode =
       VALID_INTENT_MODES.includes(rawIntentMode) ? rawIntentMode :
@@ -1349,8 +1365,8 @@ ADDITIONAL FOCUSED MODE RULES:
       agentStatuses["jarvis"] = { status: getJarvisDisplayStatus(focusedResult, focusedValid), name: "J.A.R.V.I.S", color: "#ffd966", avatar: "JV", company: "ANTHROPIC · CLAUDE HAIKU" };
       const synthesis = focusedValid ? focusedResult.text : "SYNTHESIS UNAVAILABLE. Please retry.";
       if (focusedResult.success && isValidResponse(focusedResult.text, "jarvis")) {
-        saveHistory(question, [], synthesis, "LOW", activeThreadId, turnNumber);
-        summarizeThread(activeThreadId).catch(() => {});
+        saveHistory(question, [], synthesis, "LOW", activeThreadId, turnNumber, session.sessionId);
+        summarizeThread(activeThreadId, session.sessionId).catch(() => {});
       }
       return respond(200, { synthesis, confidence: "LOW", queryType, agentStatuses, debateOutputs: [], quorumFailed: false, routingMode: "focused", threadId: activeThreadId }, corsHeaders);
     }
@@ -1404,8 +1420,8 @@ ADDITIONAL FOCUSED MODE RULES:
       }
       agentStatuses["jarvis"] = { status: getJarvisDisplayStatus(jarvisResult, primaryValid), name: "J.A.R.V.I.S", color: "#ffd966", avatar: "JV", company: "ANTHROPIC · CLAUDE HAIKU" };
       if (usedSuccessfulSynthesis) {
-        saveHistory(question, debateOutputs, synthesis, confidence, activeThreadId, turnNumber);
-        summarizeThread(activeThreadId).catch(() => {});
+        saveHistory(question, debateOutputs, synthesis, confidence, activeThreadId, turnNumber, session.sessionId);
+        summarizeThread(activeThreadId, session.sessionId).catch(() => {});
       }
       return respond(200, { synthesis, confidence, queryType, agentStatuses, debateOutputs, quorumFailed: false, routingMode: "single", threadId: activeThreadId }, corsHeaders);
 
@@ -1485,8 +1501,8 @@ Challenge the Analyst's specific arguments above.`;
       }
       agentStatuses["jarvis"] = { status: getJarvisDisplayStatus(jarvisResult, primaryValid), name: "J.A.R.V.I.S", color: "#ffd966", avatar: "JV", company: "ANTHROPIC · CLAUDE HAIKU" };
       if (usedSuccessfulSynthesis) {
-        saveHistory(question, debateOutputs, synthesis, confidence, activeThreadId, turnNumber);
-        summarizeThread(activeThreadId).catch(() => {});
+        saveHistory(question, debateOutputs, synthesis, confidence, activeThreadId, turnNumber, session.sessionId);
+        summarizeThread(activeThreadId, session.sessionId).catch(() => {});
       }
       return respond(200, { synthesis, confidence, queryType, agentStatuses, debateOutputs, quorumFailed: false, routingMode: "dual", threadId: activeThreadId }, corsHeaders);
 
@@ -1594,8 +1610,8 @@ Challenge the Analyst's specific arguments above.`;
 
       const finalSynthesis = synthesis || "SYNTHESIS MODULE TEMPORARILY UNAVAILABLE. Please retry.";
       if (synthesis) {
-        saveHistory(question, debateOutputs, finalSynthesis, confidence, activeThreadId, turnNumber);
-        summarizeThread(activeThreadId).catch(() => {});
+        saveHistory(question, debateOutputs, finalSynthesis, confidence, activeThreadId, turnNumber, session.sessionId);
+        summarizeThread(activeThreadId, session.sessionId).catch(() => {});
       }
       return respond(200, { synthesis: finalSynthesis, confidence, queryType, agentStatuses, debateOutputs, quorumFailed: false, routingMode: "swarm", threadId: activeThreadId }, corsHeaders);
     }
@@ -1664,12 +1680,12 @@ exports.streamHandler = async function(body, send, requestMeta = {}) {
     let threadContext = "";
     let turnNumber = 1;
     if (threadId) {
-      const { context, nextTurn } = await fetchThreadContext(threadId);
+      const { context, nextTurn } = await fetchThreadContext(threadId, session.sessionId);
       threadContext = context;
       turnNumber = nextTurn;
     }
 
-    const memoryContext = await fetchMemoryContext().catch(() => "");
+    const memoryContext = await fetchMemoryContext(session.sessionId).catch(() => "");
 
     const intentMode =
       VALID_INTENT_MODES.includes(rawIntentMode) ? rawIntentMode :
@@ -1711,8 +1727,8 @@ ADDITIONAL FOCUSED MODE RULES:
       phaseLog("JARVIS_DONE", { route: "focused", success: focusedValid, reason: focusedResult.reason || null });
       const synthesis = focusedValid ? focusedResult.text : "SYNTHESIS UNAVAILABLE. Please retry.";
       if (focusedResult.success && isValidResponse(focusedResult.text, "jarvis")) {
-        saveHistory(question, [], synthesis, "LOW", activeThreadId, turnNumber);
-        summarizeThread(activeThreadId).catch(() => {});
+        saveHistory(question, [], synthesis, "LOW", activeThreadId, turnNumber, session.sessionId);
+        summarizeThread(activeThreadId, session.sessionId).catch(() => {});
       }
       phaseLog("STREAM_COMPLETE", { route: "focused", confidence: "LOW" });
       safeSend("complete", { synthesis, confidence: "LOW", queryType, agentStatuses, debateOutputs: [], quorumFailed: false, routingMode: "focused", threadId: activeThreadId });
@@ -1750,8 +1766,8 @@ ADDITIONAL FOCUSED MODE RULES:
       phaseLog("JARVIS_DONE", { route: "single", success: jarvisValid, reason: jarvisResult.reason || null });
       const synthesis = jarvisValid ? jarvisResult.text : "SYNTHESIS UNAVAILABLE. Please retry.";
       if (jarvisValid) {
-        saveHistory(question, debateOutputs, synthesis, confidence, activeThreadId, turnNumber);
-        summarizeThread(activeThreadId).catch(() => {});
+        saveHistory(question, debateOutputs, synthesis, confidence, activeThreadId, turnNumber, session.sessionId);
+        summarizeThread(activeThreadId, session.sessionId).catch(() => {});
       }
       phaseLog("STREAM_COMPLETE", { route: "single", confidence });
       safeSend("complete", { synthesis, confidence, queryType, agentStatuses, debateOutputs, quorumFailed: false, routingMode: "single", threadId: activeThreadId });
@@ -1802,8 +1818,8 @@ ADDITIONAL FOCUSED MODE RULES:
       phaseLog("JARVIS_DONE", { route: "dual", success: jarvisValid, reason: jarvisResult.reason || null });
       const synthesis = jarvisValid ? jarvisResult.text : "SYNTHESIS UNAVAILABLE. Please retry.";
       if (jarvisValid) {
-        saveHistory(question, debateOutputs, synthesis, confidence, activeThreadId, turnNumber);
-        summarizeThread(activeThreadId).catch(() => {});
+        saveHistory(question, debateOutputs, synthesis, confidence, activeThreadId, turnNumber, session.sessionId);
+        summarizeThread(activeThreadId, session.sessionId).catch(() => {});
       }
       phaseLog("STREAM_COMPLETE", { route: "dual", confidence });
       safeSend("complete", { synthesis, confidence, queryType, agentStatuses, debateOutputs, quorumFailed: false, routingMode: "dual", threadId: activeThreadId });
@@ -1889,8 +1905,8 @@ ADDITIONAL FOCUSED MODE RULES:
 
     const finalSynthesis = synthesis || "SYNTHESIS MODULE TEMPORARILY UNAVAILABLE. Please retry.";
     if (synthesis) {
-      saveHistory(question, debateOutputs, finalSynthesis, confidence, activeThreadId, turnNumber);
-      summarizeThread(activeThreadId).catch(() => {});
+      saveHistory(question, debateOutputs, finalSynthesis, confidence, activeThreadId, turnNumber, session.sessionId);
+      summarizeThread(activeThreadId, session.sessionId).catch(() => {});
     }
     phaseLog("STREAM_COMPLETE", { route: "swarm", confidence, usedFallback: Boolean(synthesis && !primaryValid) });
     safeSend("complete", { synthesis: finalSynthesis, confidence, queryType, agentStatuses, debateOutputs, quorumFailed: false, routingMode: "swarm", threadId: activeThreadId });

@@ -12,11 +12,12 @@ const MEMORY_MODEL       = "anthropic/claude-haiku-4-5";
 
 // ── Summarize a thread and upsert into jarvis_memory_summaries ──
 // Called after every saveHistory — non-blocking, fire and forget
-async function summarizeThread(threadId) {
+async function summarizeThread(threadId, sessionId) {
   try {
+    if (!threadId || !sessionId) return;
     // Fetch the full thread from jarvis_history
     const res = await fetch(
-      `${SUPA_URL}/rest/v1/jarvis_history?owner_id=eq.${encodeURIComponent(OWNER_ID)}&thread_id=eq.${encodeURIComponent(threadId)}&order=turn_number.asc`,
+      `${SUPA_URL}/rest/v1/jarvis_history?owner_id=eq.${encodeURIComponent(OWNER_ID)}&session_id=eq.${encodeURIComponent(sessionId)}&thread_id=eq.${encodeURIComponent(threadId)}&order=turn_number.asc`,
       { headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
     );
     const rows = await res.json();
@@ -63,24 +64,48 @@ Write only the summary, nothing else.`
     if (!summary) return;
 
     // Upsert summary for this thread (update if exists, insert if not)
-    await fetch(`${SUPA_URL}/rest/v1/jarvis_memory_summaries`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "apikey": SUPA_KEY,
-        "Authorization": `Bearer ${SUPA_KEY}`,
-        "Prefer": "resolution=merge-duplicates",
-      },
-      body: JSON.stringify({
-        owner_id: OWNER_ID,
-        thread_id: threadId,
-        summary,
-        updated_at: new Date().toISOString(),
-      }),
-    });
+    const existingSummaryRes = await fetch(
+      `${SUPA_URL}/rest/v1/jarvis_memory_summaries?owner_id=eq.${encodeURIComponent(OWNER_ID)}&session_id=eq.${encodeURIComponent(sessionId)}&thread_id=eq.${encodeURIComponent(threadId)}&select=id&limit=1`,
+      { headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
+    );
+    const existingSummaryRows = await existingSummaryRes.json();
+    const existingSummaryId = Array.isArray(existingSummaryRows) && existingSummaryRows[0]?.id ? existingSummaryRows[0].id : null;
+
+    if (existingSummaryId) {
+      await fetch(`${SUPA_URL}/rest/v1/jarvis_memory_summaries?id=eq.${encodeURIComponent(existingSummaryId)}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": SUPA_KEY,
+          "Authorization": `Bearer ${SUPA_KEY}`,
+          "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({
+          summary,
+          updated_at: new Date().toISOString(),
+        }),
+      });
+    } else {
+      await fetch(`${SUPA_URL}/rest/v1/jarvis_memory_summaries`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": SUPA_KEY,
+          "Authorization": `Bearer ${SUPA_KEY}`,
+          "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({
+          owner_id: OWNER_ID,
+          session_id: sessionId,
+          thread_id: threadId,
+          summary,
+          updated_at: new Date().toISOString(),
+        }),
+      });
+    }
 
     // Also update the rolling user profile
-    await updateUserProfile(summary);
+    await updateUserProfile(summary, sessionId);
   } catch (e) {
     // Memory is non-critical — never throw, never block
     console.error("Memory summarize error:", e?.message);
@@ -89,14 +114,16 @@ Write only the summary, nothing else.`
 
 // ── Update the rolling user profile ─────────────────────────
 // Merges the new summary into a compressed profile of the user
-async function updateUserProfile(newSummary) {
+async function updateUserProfile(newSummary, sessionId) {
   try {
+    if (!sessionId) return;
     // Fetch existing profile
     const res = await fetch(
-      `${SUPA_URL}/rest/v1/jarvis_user_profile?owner_id=eq.${encodeURIComponent(OWNER_ID)}&select=profile`,
+      `${SUPA_URL}/rest/v1/jarvis_user_profile?owner_id=eq.${encodeURIComponent(OWNER_ID)}&session_id=eq.${encodeURIComponent(sessionId)}&select=id,profile&limit=1`,
       { headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
     );
     const rows = await res.json();
+    const existingProfileId = Array.isArray(rows) && rows[0]?.id ? rows[0].id : null;
     const existingProfile = Array.isArray(rows) && rows[0]?.profile ? rows[0].profile : "";
 
     // Ask Haiku to merge old profile with new summary
@@ -138,20 +165,37 @@ Write only the updated profile bullet points, nothing else.`
     if (!updatedProfile) return;
 
     // Upsert the user profile
-    await fetch(`${SUPA_URL}/rest/v1/jarvis_user_profile`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "apikey": SUPA_KEY,
-        "Authorization": `Bearer ${SUPA_KEY}`,
-        "Prefer": "resolution=merge-duplicates",
-      },
-      body: JSON.stringify({
-        owner_id: OWNER_ID,
-        profile: updatedProfile,
-        updated_at: new Date().toISOString(),
-      }),
-    });
+    if (existingProfileId) {
+      await fetch(`${SUPA_URL}/rest/v1/jarvis_user_profile?id=eq.${encodeURIComponent(existingProfileId)}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": SUPA_KEY,
+          "Authorization": `Bearer ${SUPA_KEY}`,
+          "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({
+          profile: updatedProfile,
+          updated_at: new Date().toISOString(),
+        }),
+      });
+    } else {
+      await fetch(`${SUPA_URL}/rest/v1/jarvis_user_profile`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": SUPA_KEY,
+          "Authorization": `Bearer ${SUPA_KEY}`,
+          "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({
+          owner_id: OWNER_ID,
+          session_id: sessionId,
+          profile: updatedProfile,
+          updated_at: new Date().toISOString(),
+        }),
+      });
+    }
   } catch (e) {
     console.error("Memory profile update error:", e?.message);
   }
@@ -159,11 +203,12 @@ Write only the updated profile bullet points, nothing else.`
 
 // ── Fetch memory context for injection into synthesis ────────
 // Returns a compact string ready to inject into the prompt
-async function fetchMemoryContext() {
+async function fetchMemoryContext(sessionId) {
   try {
+    if (!sessionId) return "";
     // Get user profile
     const profileRes = await fetch(
-      `${SUPA_URL}/rest/v1/jarvis_user_profile?owner_id=eq.${encodeURIComponent(OWNER_ID)}&select=profile`,
+      `${SUPA_URL}/rest/v1/jarvis_user_profile?owner_id=eq.${encodeURIComponent(OWNER_ID)}&session_id=eq.${encodeURIComponent(sessionId)}&select=id,profile&limit=1`,
       { headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
     );
     const profileRows = await profileRes.json();
@@ -173,7 +218,7 @@ async function fetchMemoryContext() {
 
     // Get last 5 thread summaries
     const summaryRes = await fetch(
-      `${SUPA_URL}/rest/v1/jarvis_memory_summaries?owner_id=eq.${encodeURIComponent(OWNER_ID)}&order=updated_at.desc&limit=5&select=summary`,
+      `${SUPA_URL}/rest/v1/jarvis_memory_summaries?owner_id=eq.${encodeURIComponent(OWNER_ID)}&session_id=eq.${encodeURIComponent(sessionId)}&order=updated_at.desc&limit=5&select=summary`,
       { headers: { "apikey": SUPA_KEY, "Authorization": `Bearer ${SUPA_KEY}` } }
     );
     const summaryRows = await summaryRes.json();
