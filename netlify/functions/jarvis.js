@@ -736,16 +736,58 @@ const JARVIS_MODEL   = "anthropic/claude-haiku-4-5";
 const OBJECTION_MODEL = "deepseek/deepseek-chat-v3-0324";
 
 // ── JARVIS Synthesis Prompt ───────────────────────────────────
+function isLikelyMetaFollowUpSynthesis(question = "", synthesis = "") {
+  const q = String(question || "").toLowerCase().trim();
+  const s = String(synthesis || "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (!q || !s || !isReferentialFollowUp(q)) return false;
+
+  const strongMarkers = [
+    "request lacks a target",
+    "without knowing what you're asking me to condense",
+    "without knowing what you’re asking me to condense",
+    "i cannot compact the text without knowing what you're asking me to condense",
+    "i cannot compact the text without knowing what you’re asking me to condense",
+    "i can't compact the text without knowing what you're asking me to condense",
+    "i can’t compact the text without knowing what you’re asking me to condense",
+    "you've provided swarm debate about how condensation works, but no source material to actually compress",
+    "you’ve provided swarm debate about how condensation works, but no source material to actually compress",
+    "i cannot execute this challenge without a concrete target",
+    "clarify your referent",
+    "the request is ambiguous enough",
+    "ambiguity is genuine",
+    "meta-discussion",
+    "critiquing my own request for clarification",
+    "smart people arguing about nothing",
+  ];
+
+  if (strongMarkers.some(marker => s.includes(marker))) return true;
+
+  const softMetaSignals = [
+    "lacks a target",
+    "without a concrete target",
+    "ask for clarification",
+    "latest prior completed jarvis synthesis",
+    "ambiguity discussion",
+    "clarify it directly",
+    "paste the specific text you need condensed",
+    "do you want me to challenge",
+  ];
+
+  const matchedSoftSignals = softMetaSignals.filter(marker => s.includes(marker)).length;
+  return matchedSoftSignals >= 2;
+}
+
 function buildLatestTargetPreferenceNote(threadContext = "", userQuery = "", followUpOperation = null) {
   if (!threadContext || !isReferentialFollowUp(userQuery)) return "";
 
   return `
-LOCAL TARGET RESOLUTION RULE: Prefer the locally active thread target over broader conversation history. If RECENT THREAD CONTEXT contains a PRIMARY FOLLOW-UP TARGET or an obviously active latest blueprint/synthesis, operate on that target by default.
+LOCAL TARGET RESOLUTION RULE: Prefer the locally active thread target over broader conversation history. If RECENT THREAD CONTEXT contains a PRIMARY FOLLOW-UP TARGET, operate on that marked target by default.
+If the latest turn is only a clarification, target-ambiguity warning, or other meta-wrapper around the follow-up itself, do not treat that wrapper as the object to compress, challenge, expand, or reinterpret. Continue operating on the most recent substantive target marked in RECENT THREAD CONTEXT unless the user explicitly points elsewhere.
 If the current swarm outputs are generic, partially mismatched, or less specific than the active thread target, do not refuse on that basis alone. Use the active thread target as the anchor and answer conditionally if needed (for example: "Assuming you mean the current blueprint...").
 For compressed same-thread comparison shorthand such as "stronger or not," "net-net," "better wedge," "what did narrowing buy me," "what did narrowing cost me," or verdict-style follow-ups, inherit the active comparison already established in the thread rather than drifting to a literal dictionary meaning.
 When an active business or product comparison exists in the thread, prefer that domain meaning for terms like "wedge," "narrowing," "better," "fails," and similar shorthand unless the user explicitly changes domains.
 When the user sends a very short or abstract same-thread follow-up such as "why," "how," "in what sense," "really," "enough," or "change the verdict," bind it to the latest active judgment or comparison already established in RECENT THREAD CONTEXT by default. Interpret that kind of follow-up as a request to explain, pressure-test, or revisit the immediately prior local judgment unless the user clearly introduces a new subject.
-Only ask for clarification when there are multiple genuinely competing recent local targets inside RECENT THREAD CONTEXT and choosing the latest one would likely be wrong.
+Only ask for clarification when there are multiple genuinely competing recent substantive targets inside RECENT THREAD CONTEXT and choosing the marked target would likely be wrong.
 `;
 }
 
@@ -837,7 +879,7 @@ function buildJarvisSynthesisPrompt(queryType, agentCount, totalAgents, threadCo
 
   const referentialNote = (threadContext && isReferentialFollowUp(userQuery))
     ? `
-NOTE: The user's message "${userQuery}" is a same-thread referential follow-up instruction. By default, resolve its referent to the latest prior completed JARVIS synthesis shown in RECENT THREAD CONTEXT above. Treat that latest prior synthesis as the working target unless the user explicitly points to a different passage. Do not treat the referent as the current user command, ambiguity discussion, format discussion, or other meta-commentary. Do not ask for clarification just because the follow-up uses words like "this" or "that". Clarify only if there are multiple genuinely competing prior synthesis targets and choosing the latest one would likely be wrong.
+NOTE: The user's message "${userQuery}" is a same-thread referential follow-up instruction. By default, resolve its referent to the active substantive JARVIS synthesis marked as PRIMARY FOLLOW-UP TARGET in RECENT THREAD CONTEXT above. If the latest turn is only a clarification, ambiguity warning, or other meta-commentary about the follow-up itself, do not treat that meta turn as the object of the new request. Do not treat the referent as the current user command, ambiguity discussion, format discussion, or other meta-commentary. Do not ask for clarification just because the follow-up uses words like "this" or "that". Clarify only if there are multiple genuinely competing substantive prior targets and choosing the marked one would likely be wrong.
 `
     : "";
 
@@ -848,25 +890,25 @@ NOTE: The user's message "${userQuery}" is a same-thread referential follow-up i
   const followUpOperationNote = (threadContext && isReferentialFollowUp(userQuery) && followUpOperation)
     ? {
         challenge: `
-FOLLOW-UP OPERATION: CHALLENGE. Pressure-test the latest prior completed JARVIS synthesis in the thread context above. Surface the strongest flaw, hidden assumption, or counterargument inside that prior synthesis, then give the corrected verdict if the challenge changes the conclusion. Do not challenge the user's wording or drift into ambiguity/meta-discussion unless the user explicitly asks for that.
+FOLLOW-UP OPERATION: CHALLENGE. Pressure-test the active substantive JARVIS synthesis marked as PRIMARY FOLLOW-UP TARGET in the thread context above. Surface the strongest flaw, hidden assumption, or counterargument inside that target, then give the corrected verdict if the challenge changes the conclusion. If the latest turn is only a clarification or ambiguity wrapper, challenge the underlying substantive target instead of the wrapper. Do not challenge the user's wording or drift into ambiguity/meta-discussion unless the user explicitly asks for that.
 `,
         expand: `
-FOLLOW-UP OPERATION: EXPAND. Build on the latest prior completed JARVIS synthesis in the thread context above. Add depth, specificity, implementation detail, or stronger supporting reasoning without changing the core answer unless the added detail truly requires it. Do not expand the user's command itself or drift into ambiguity/meta-discussion.
+FOLLOW-UP OPERATION: EXPAND. Build on the active substantive JARVIS synthesis marked as PRIMARY FOLLOW-UP TARGET in the thread context above. Add depth, specificity, implementation detail, or stronger supporting reasoning without changing the core answer unless the added detail truly requires it. If the latest turn is only a clarification or ambiguity wrapper, expand the underlying substantive target instead of the wrapper. Do not expand the user's command itself or drift into ambiguity/meta-discussion.
 `,
         compress: `
-FOLLOW-UP OPERATION: COMPRESS. Condense the latest prior completed JARVIS synthesis in the thread context above unless the user explicitly names a narrower passage. Preserve the core judgment and most important reasoning, but make it leaner, clearer, and easier to act on. Do not ask for clarification unless there are multiple genuinely competing prior synthesis targets and choosing the latest one would likely be wrong.
+FOLLOW-UP OPERATION: COMPRESS. Condense the active substantive JARVIS synthesis marked as PRIMARY FOLLOW-UP TARGET in the thread context above unless the user explicitly names a narrower passage. Preserve the core judgment and most important reasoning, but make it leaner, clearer, and easier to act on. If the latest turn is only a clarification or ambiguity wrapper, compress the underlying substantive target instead of the wrapper. Do not ask for clarification unless there are multiple genuinely competing substantive prior targets and choosing the marked one would likely be wrong.
 `,
         translate: `
-FOLLOW-UP OPERATION: TRANSLATE. Translate or restate the latest prior completed JARVIS synthesis in the form the user is implicitly asking for unless the user explicitly names a narrower passage. Preserve the same underlying judgment wherever possible, and when the user says "plain English" or similar, simplify the prior synthesis directly rather than asking what "that" refers to. Do not ask for clarification unless there are multiple genuinely competing prior synthesis targets and choosing the latest one would likely be wrong.
+FOLLOW-UP OPERATION: TRANSLATE. Translate or restate the active substantive JARVIS synthesis marked as PRIMARY FOLLOW-UP TARGET in the form the user is implicitly asking for unless the user explicitly names a narrower passage. Preserve the same underlying judgment wherever possible, and when the user says "plain English" or similar, simplify the substantive target directly rather than asking what "that" refers to. If the latest turn is only a clarification or ambiguity wrapper, translate the underlying substantive target instead of the wrapper. Do not ask for clarification unless there are multiple genuinely competing substantive prior targets and choosing the marked one would likely be wrong.
 `,
         explain_prior_judgment: `
-FOLLOW-UP OPERATION: EXPLAIN PRIOR JUDGMENT. Treat the user's message as a request to explain the latest prior completed JARVIS synthesis or active comparison in the thread context above. Explain why the prior judgment was made, what criteria drove it, and in what specific sense the prior answer was stronger, weaker, sufficient, insufficient, better, or worse. Do not drift into abstract dictionary meaning or generic philosophy unless the thread itself was explicitly philosophical.
+FOLLOW-UP OPERATION: EXPLAIN PRIOR JUDGMENT. Treat the user's message as a request to explain the active substantive JARVIS synthesis or active comparison marked as PRIMARY FOLLOW-UP TARGET in the thread context above. Explain why the prior judgment was made, what criteria drove it, and in what specific sense the prior answer was stronger, weaker, sufficient, insufficient, better, or worse. If the latest turn is only a clarification or ambiguity wrapper, explain the underlying substantive target instead of the wrapper. Do not drift into abstract dictionary meaning or generic philosophy unless the thread itself was explicitly philosophical.
 `,
         revisit_prior_verdict: `
-FOLLOW-UP OPERATION: REVISIT PRIOR VERDICT. Treat the user's message as a request to test whether the latest prior completed JARVIS synthesis should change. Re-evaluate the prior verdict against the active local target in the thread, state whether the verdict changes, and explain exactly what changed or did not change. Preserve the distinction between "materially improved" and "fully proven" when relevant.
+FOLLOW-UP OPERATION: REVISIT PRIOR VERDICT. Treat the user's message as a request to test whether the active substantive JARVIS synthesis marked as PRIMARY FOLLOW-UP TARGET should change. Re-evaluate the prior verdict against that active local target, state whether the verdict changes, and explain exactly what changed or did not change. If the latest turn is only a clarification or ambiguity wrapper, revisit the underlying substantive target instead. Preserve the distinction between "materially improved" and "fully proven" when relevant.
 `,
         stress_test_prior_judgment: `
-FOLLOW-UP OPERATION: STRESS-TEST PRIOR JUDGMENT. Treat the user's message as a short same-thread challenge to the latest prior completed JARVIS synthesis or active comparison. Test whether the prior judgment was actually sufficient, strong enough, or justified. Answer directly, but keep the judgment anchored to the thread-local target rather than drifting into generic interpretation.
+FOLLOW-UP OPERATION: STRESS-TEST PRIOR JUDGMENT. Treat the user's message as a short same-thread challenge to the active substantive JARVIS synthesis or active comparison marked as PRIMARY FOLLOW-UP TARGET. Test whether that prior judgment was actually sufficient, strong enough, or justified. If the latest turn is only a clarification or ambiguity wrapper, stress-test the underlying substantive target instead. Answer directly, but keep the judgment anchored to the thread-local target rather than drifting into generic interpretation.
 `,
       }[followUpOperation] || ""
     : "";
@@ -1154,23 +1196,28 @@ async function fetchThreadContext(ownerScope, threadId) {
     const sorted = [...rows].sort((a, b) => a.turn_number - b.turn_number);
     const nextTurn = (rows[0].turn_number || 0) + 1;
     const latestTurnNumber = sorted[sorted.length - 1]?.turn_number;
+    const primaryTargetRow = [...sorted].reverse().find(r => !isLikelyMetaFollowUpSynthesis(r.question, r.synthesis)) || sorted[sorted.length - 1];
+    const primaryTargetTurnNumber = primaryTargetRow?.turn_number;
     const context = sorted.map(r => {
       const isLatest = r.turn_number === latestTurnNumber;
+      const isPrimaryTarget = r.turn_number === primaryTargetTurnNumber;
       const synthesisText = typeof r.synthesis === "string"
         ? r.synthesis.replace(/\s+/g, " ").trim()
         : "";
-      const maxChars = isLatest ? 1200 : 450;
+      const maxChars = isPrimaryTarget ? 1200 : (isLatest ? 700 : 450);
       const synthesisPreview = synthesisText.slice(0, maxChars);
       const previewSuffix = synthesisText.length > synthesisPreview.length ? "..." : "";
-      const targetMarker = isLatest
-        ? "PRIMARY FOLLOW-UP TARGET: This is the latest prior completed JARVIS synthesis in this thread. Same-thread referential follow-ups should default to operating on this answer unless the user explicitly points elsewhere.\n"
+      const targetMarker = isPrimaryTarget
+        ? "PRIMARY FOLLOW-UP TARGET: This is the most recent substantive JARVIS synthesis in this thread. Same-thread referential follow-ups should default to operating on this answer unless the user explicitly points elsewhere.\n"
         : "";
-      return `[Turn ${r.turn_number}] User asked: "${r.question}"\n${targetMarker}JARVIS answered: "${synthesisPreview}${previewSuffix}" (${r.confidence} confidence)`;
+      const latestMetaMarker = (isLatest && !isPrimaryTarget)
+        ? "LATEST TURN NOTE: This newer turn appears to be meta-clarification or target-resolution chatter. Keep it as context, but do not treat it as the default object of compact/challenge-style follow-ups unless the user explicitly points to it.\n"
+        : "";
+      return `[Turn ${r.turn_number}] User asked: "${r.question}"\n${targetMarker}${latestMetaMarker}JARVIS answered: "${synthesisPreview}${previewSuffix}" (${r.confidence} confidence)`;
     }).join("\n\n");
     return { context, nextTurn };
   } catch { return { context: "", nextTurn: 1 }; }
 }
-
 async function loadHistory(ownerScope) {
   try {
     const res = await fetch(
