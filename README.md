@@ -29,7 +29,7 @@ I built Nexus-Demo to show practical AI system design in public: orchestration, 
 
 ## Demo
 
-Add your live demo link here.
+https://nexus-demo-viciousvader.netlify.app/
 
 ## Build timeline
 
