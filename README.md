@@ -2,7 +2,7 @@
 
 Nexus-Demo is the public demo version of my J.A.R.V.I.S project: a multi-agent reasoning and orchestration system built solo.
 
-Demo Video
+# Demo Video
 
 Watch the J.A.R.V.I.S demo on YouTube:
 https://www.youtube.com/watch?v=DdKI8N7kzEU
