@@ -1,4 +1,4 @@
-# Nexus-Demo
+# J.A.R.V.I.S/Nexus-Demo
 
 Nexus-Demo is the public demo version of my J.A.R.V.I.S project: a multi-agent reasoning and orchestration system built solo.
 
