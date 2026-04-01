@@ -2,6 +2,18 @@
 
 Nexus-Demo is the public demo version of my J.A.R.V.I.S project: a multi-agent reasoning and orchestration system built solo.
 
+Demo Video
+
+Watch the J.A.R.V.I.S demo on YouTube:
+https://www.youtube.com/watch?v=DdKI8N7kzEU
+
+This demo shows:
+
+Single routing for simple questions
+Dual routing for coding/debugging tasks
+Auto routing for broader reasoning
+thread continuity across follow-up prompts
+
 ## What it is
 
 This project demonstrates a role-based AI workflow that routes requests by problem type and depth, runs specialized reasoning roles, validates outputs, and synthesizes a final response.
